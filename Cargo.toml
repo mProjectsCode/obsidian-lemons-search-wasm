@@ -1,6 +1,6 @@
 [package]
 name = "lemons-search"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Moritz Jung <m.projects.code@gmail.com>"]
 edition = "2021"
 
