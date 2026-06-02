@@ -1,0 +1,15 @@
+{
+  "name": "obsidian-lemons-search-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wasm-pack build --target web --scope lemons_dev",
+    "build:dev": "wasm-pack build --dev --target web --scope lemons_dev",
+    "fmt": "cargo fmt",
+    "fmt:check": "cargo fmt --check",
+    "lint": "cargo clippy",
+    "test": "wasm-pack test --node",
+    "pack:release": "wasm-pack build --target web --scope lemons_dev && cd pkg && npm pack --pack-destination .."
+  }
+}

@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+      - name: Build package
+        run: wasm-pack build --target web --scope lemons_dev
+      - name: Pack package
+        run: |
+          cd pkg
+          npm pack --pack-destination ..
+      - name: Rename package tarball
+        run: |
+          mv lemons_dev-lemons-search-*.tgz "lemons-search-${GITHUB_REF_NAME}.tgz"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" "lemons-search-${GITHUB_REF_NAME}.tgz" --verify-tag --title "${GITHUB_REF_NAME}"
