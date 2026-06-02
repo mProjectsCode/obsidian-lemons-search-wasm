@@ -21,6 +21,12 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: Install wasm-pack
         run: cargo install wasm-pack
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy
+      - name: Test
+        run: wasm-pack test --node
       - name: Build package
         run: wasm-pack build --target web --scope lemons_dev
       - name: Pack package
