@@ -10,6 +10,6 @@
     "fmt:check": "cargo fmt --check",
     "lint": "cargo clippy",
     "test": "wasm-pack test --node",
-    "pack:release": "wasm-pack build --target web --scope lemons_dev && cd pkg && npm pack --pack-destination .."
+    "pack:release": "wasm-pack build --target web --scope lemons_dev && npm pack ./pkg"
   }
 }

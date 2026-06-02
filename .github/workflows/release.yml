@@ -24,9 +24,7 @@ jobs:
       - name: Build package
         run: wasm-pack build --target web --scope lemons_dev
       - name: Pack package
-        run: |
-          cd pkg
-          npm pack --pack-destination ..
+        run: npm pack ./pkg
       - name: Rename package tarball
         run: |
           mv lemons_dev-lemons-search-*.tgz "lemons-search-${GITHUB_REF_NAME}.tgz"
