@@ -1,3 +1,5 @@
+use std::collections::BinaryHeap;
+
 use nucleo_matcher::{Utf32Str, Utf32String};
 use web_sys::js_sys;
 
@@ -20,7 +22,7 @@ impl NumberedString {
     }
 
     #[inline]
-    pub fn utf32srt(&self) -> Utf32Str<'_> {
+    pub fn utf32str(&self) -> Utf32Str<'_> {
         self.utf32.slice(..)
     }
 
@@ -45,6 +47,22 @@ impl ScoredIndex {
     #[inline]
     pub fn idx(&self) -> usize {
         self.1
+    }
+
+    pub fn push_top_score(heap: &mut BinaryHeap<Self>, scored_idx: Self, max_results: usize) {
+        if heap.len() < max_results {
+            heap.push(scored_idx);
+            return;
+        }
+
+        let Some(min_idx) = heap.peek() else {
+            return;
+        };
+
+        if scored_idx.score() > min_idx.score() {
+            heap.pop();
+            heap.push(scored_idx);
+        }
     }
 }
 
@@ -126,6 +144,107 @@ impl SearchResult {
         let ranges = js_sys::Uint32Array::from(self.highlight_ranges.as_slice());
         let _ = js_sys::Reflect::set(&obj, &"index".into(), &self.index.into());
         let _ = js_sys::Reflect::set(&obj, &"r".into(), &ranges.into());
+
+        obj
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreSearchResult {
+    pub id: String,
+    pub score: u32,
+    pub highlight_ranges: Vec<u32>,
+}
+
+impl StoreSearchResult {
+    pub fn new(id: String, score: u32) -> Self {
+        StoreSearchResult {
+            id,
+            score,
+            highlight_ranges: Vec::new(),
+        }
+    }
+
+    pub fn new_from_ranges(id: String, score: u32, highlight_ranges: &[u32]) -> Self {
+        StoreSearchResult {
+            id,
+            score,
+            highlight_ranges: compact_highlight_ranges(highlight_ranges),
+        }
+    }
+
+    pub fn into_js_object(self) -> js_sys::Object {
+        let obj = js_sys::Object::new();
+        let ranges = js_sys::Uint32Array::from(self.highlight_ranges.as_slice());
+        let _ = js_sys::Reflect::set(&obj, &"id".into(), &self.id.into());
+        let _ = js_sys::Reflect::set(&obj, &"score".into(), &self.score.into());
+        let _ = js_sys::Reflect::set(&obj, &"r".into(), &ranges.into());
+
+        obj
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreHealth {
+    pub exists: bool,
+    pub kind: String,
+    pub live_records: usize,
+    pub tombstones: usize,
+    pub record_ids: Vec<String>,
+    pub posting_terms: usize,
+    pub posting_occurrences: usize,
+}
+
+impl StoreHealth {
+    pub fn new(
+        kind: &str,
+        live_records: usize,
+        tombstones: usize,
+        mut record_ids: Vec<String>,
+        posting_terms: usize,
+        posting_occurrences: usize,
+    ) -> Self {
+        record_ids.sort();
+        StoreHealth {
+            exists: true,
+            kind: kind.to_string(),
+            live_records,
+            tombstones,
+            record_ids,
+            posting_terms,
+            posting_occurrences,
+        }
+    }
+
+    pub fn missing() -> Self {
+        StoreHealth {
+            exists: false,
+            kind: String::new(),
+            live_records: 0,
+            tombstones: 0,
+            record_ids: Vec::new(),
+            posting_terms: 0,
+            posting_occurrences: 0,
+        }
+    }
+
+    pub fn into_js_object(self) -> js_sys::Object {
+        let obj = js_sys::Object::new();
+        let ids = js_sys::Array::new();
+        for id in self.record_ids {
+            ids.push(&id.into());
+        }
+        let _ = js_sys::Reflect::set(&obj, &"exists".into(), &self.exists.into());
+        let _ = js_sys::Reflect::set(&obj, &"kind".into(), &self.kind.into());
+        let _ = js_sys::Reflect::set(&obj, &"liveRecords".into(), &self.live_records.into());
+        let _ = js_sys::Reflect::set(&obj, &"tombstones".into(), &self.tombstones.into());
+        let _ = js_sys::Reflect::set(&obj, &"recordIds".into(), &ids.into());
+        let _ = js_sys::Reflect::set(&obj, &"postingTerms".into(), &self.posting_terms.into());
+        let _ = js_sys::Reflect::set(
+            &obj,
+            &"postingOccurrences".into(),
+            &self.posting_occurrences.into(),
+        );
 
         obj
     }
