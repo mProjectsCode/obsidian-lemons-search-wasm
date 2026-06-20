@@ -74,6 +74,23 @@ impl SearchEngine {
         self.reset_sessions_for_store(store_id);
     }
 
+    /// Starts a bulk rebuild by clearing the datastore and enabling faster
+    /// batched ingestion where supported by the underlying store.
+    pub fn begin_bulk_load(&mut self, store_id: &str) {
+        if let Some(store) = self.stores.get_mut(store_id) {
+            store.begin_bulk_load();
+        }
+        self.reset_sessions_for_store(store_id);
+    }
+
+    /// Finishes a bulk rebuild and restores query-ready datastore invariants.
+    pub fn finish_bulk_load(&mut self, store_id: &str) {
+        if let Some(store) = self.stores.get_mut(store_id) {
+            store.finish_bulk_load();
+        }
+        self.reset_sessions_for_store(store_id);
+    }
+
     /// Inserts or replaces a single record in the target datastore.
     pub fn upsert_record(&mut self, store_id: &str, id: &str, text: &str) {
         if let Some(store) = self.stores.get_mut(store_id) {
@@ -107,6 +124,14 @@ impl SearchEngine {
             for id in ids {
                 store.delete(&id);
             }
+        }
+        self.reset_sessions_for_store(store_id);
+    }
+
+    /// Deletes every record whose id starts with `prefix`.
+    pub fn delete_records_by_prefix(&mut self, store_id: &str, prefix: &str) {
+        if let Some(store) = self.stores.get_mut(store_id) {
+            store.delete_by_prefix(prefix);
         }
         self.reset_sessions_for_store(store_id);
     }

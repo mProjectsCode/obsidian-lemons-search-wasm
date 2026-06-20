@@ -66,10 +66,31 @@ impl Datastore {
         }
     }
 
+    pub(crate) fn delete_by_prefix(&mut self, prefix: &str) {
+        match self {
+            Datastore::Fuzzy(store) => store.delete_by_prefix(prefix),
+            Datastore::FullText(store) => store.delete_by_prefix(prefix),
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         match self {
             Datastore::Fuzzy(store) => store.clear(),
             Datastore::FullText(store) => store.clear(),
+        }
+    }
+
+    pub(crate) fn begin_bulk_load(&mut self) {
+        match self {
+            Datastore::Fuzzy(store) => store.clear(),
+            Datastore::FullText(store) => store.begin_bulk_load(),
+        }
+    }
+
+    pub(crate) fn finish_bulk_load(&mut self) {
+        match self {
+            Datastore::Fuzzy(_) => {}
+            Datastore::FullText(store) => store.finish_bulk_load(),
         }
     }
 

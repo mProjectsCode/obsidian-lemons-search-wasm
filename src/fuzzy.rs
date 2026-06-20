@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
@@ -7,6 +7,7 @@ use nucleo_matcher::{
 
 use crate::{
     datastore::DatastoreKind,
+    record_table::RecordTable,
     utils::{NumberedString, ScoredIndex, StoreHealth, StoreSearchResult},
 };
 
@@ -29,73 +30,68 @@ impl FuzzySessionState {
     }
 }
 
-/// One fuzzy-searchable record and its stable external id.
+/// One fuzzy-searchable record.
 struct FuzzyRecord {
-    id: String,
     text: NumberedString,
 }
 
 /// Sparse fuzzy-search datastore backed by `nucleo_matcher`.
 ///
-/// Deletions leave tombstones in `records` so existing numeric indices remain
-/// stable for cached session candidates.
+/// Deletions leave reusable tombstones so existing numeric indices remain
+/// stable for cached session candidates without growing the slot vector
+/// indefinitely.
 pub(crate) struct FuzzyDatastore {
-    records: Vec<Option<FuzzyRecord>>,
-    id_to_index: HashMap<String, usize>,
+    records: RecordTable<FuzzyRecord>,
 }
 
 impl FuzzyDatastore {
     /// Creates an empty fuzzy datastore.
     pub(crate) fn new() -> Self {
         FuzzyDatastore {
-            records: Vec::new(),
-            id_to_index: HashMap::new(),
+            records: RecordTable::new(),
         }
     }
 
     /// Inserts or replaces a record by its external id.
     pub(crate) fn upsert(&mut self, id: String, text: String) {
-        if let Some(&idx) = self.id_to_index.get(&id) {
-            self.records[idx] = Some(FuzzyRecord {
-                id,
-                text: NumberedString::new(text),
-            });
-            return;
-        }
-
-        let idx = self.records.len();
-        self.id_to_index.insert(id.clone(), idx);
-        self.records.push(Some(FuzzyRecord {
+        self.records.upsert(
             id,
-            text: NumberedString::new(text),
-        }));
+            FuzzyRecord {
+                text: NumberedString::new(text),
+            },
+        );
     }
 
-    /// Removes a record, leaving a tombstone at its old numeric index.
+    /// Removes a record, leaving a reusable tombstone at its old numeric index.
     pub(crate) fn delete(&mut self, id: &str) {
-        if let Some(idx) = self.id_to_index.remove(id) {
-            self.records[idx] = None;
+        self.records.delete(id);
+    }
+
+    /// Removes every record whose external id starts with `prefix`.
+    pub(crate) fn delete_by_prefix(&mut self, prefix: &str) {
+        let ids = self
+            .records
+            .record_ids()
+            .into_iter()
+            .filter(|id| id.starts_with(prefix))
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.delete(&id);
         }
     }
 
     /// Removes every record and tombstone.
     pub(crate) fn clear(&mut self) {
         self.records.clear();
-        self.id_to_index.clear();
     }
 
     /// Builds a lightweight health snapshot used by tests and diagnostics.
     pub(crate) fn health(&self) -> StoreHealth {
-        let live_records = self
-            .records
-            .iter()
-            .filter(|record| record.is_some())
-            .count();
         StoreHealth::new(
             DatastoreKind::Fuzzy.as_str(),
-            live_records,
-            self.records.len().saturating_sub(live_records),
-            self.id_to_index.keys().cloned().collect(),
+            self.records.live_record_count(),
+            self.records.tombstone_count(),
+            self.records.record_ids(),
             0,
             0,
         )
@@ -120,9 +116,8 @@ impl FuzzyDatastore {
             return self
                 .records
                 .iter()
-                .flatten()
                 .take(max_results)
-                .map(|record| StoreSearchResult::new(record.id.clone(), 0))
+                .map(|record| StoreSearchResult::new(record.id.to_string(), 0))
                 .collect();
         }
 
@@ -132,7 +127,7 @@ impl FuzzyDatastore {
         let candidate_indices = if can_narrow && !session.last_match_ids.is_empty() {
             std::mem::take(&mut session.last_match_ids)
         } else {
-            (0..self.records.len()).collect()
+            (0..self.records.slot_count()).collect()
         };
 
         let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
@@ -161,13 +156,13 @@ impl FuzzyDatastore {
             .into_sorted_vec()
             .into_iter()
             .filter_map(|scored_idx| {
-                let record = self.records.get(scored_idx.idx())?.as_ref()?;
+                let record = self.records.get(scored_idx.idx())?;
                 indices.clear();
-                let _ = pattern.indices(record.text.utf32str(), &mut matcher, &mut indices);
+                let _ = pattern.indices(record.value.text.utf32str(), &mut matcher, &mut indices);
                 indices.sort_unstable();
                 indices.dedup();
                 Some(StoreSearchResult::new_from_ranges(
-                    record.id.clone(),
+                    record.id.to_string(),
                     scored_idx.score(),
                     &indices,
                 ))
@@ -186,14 +181,10 @@ impl FuzzyDatastore {
         scored: &mut BinaryHeap<ScoredIndex>,
         next_match_ids: &mut Vec<usize>,
     ) {
-        let Some(record) = self
-            .records
-            .get(data_idx)
-            .and_then(|record| record.as_ref())
-        else {
+        let Some(record) = self.records.get(data_idx) else {
             return;
         };
-        let Some(score) = pattern.score(record.text.utf32str(), matcher) else {
+        let Some(score) = pattern.score(record.value.text.utf32str(), matcher) else {
             return;
         };
 
@@ -212,5 +203,29 @@ pub(crate) fn reparse_pattern(pattern: &mut Option<Pattern>, query: &str) {
             CaseMatching::Smart,
             Normalization::Smart,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuzzyDatastore;
+
+    #[test]
+    fn reuses_deleted_slots_and_tracks_health_without_scanning() {
+        let mut store = FuzzyDatastore::new();
+        store.upsert("a".to_string(), "apple".to_string());
+        store.upsert("b".to_string(), "banana".to_string());
+        store.delete("a");
+
+        let health = store.health();
+        assert_eq!(health.live_records, 1);
+        assert_eq!(health.tombstones, 1);
+
+        store.upsert("c".to_string(), "citrus".to_string());
+
+        let health = store.health();
+        assert_eq!(health.live_records, 2);
+        assert_eq!(health.tombstones, 0);
+        assert_eq!(health.record_ids, vec!["b", "c"]);
     }
 }

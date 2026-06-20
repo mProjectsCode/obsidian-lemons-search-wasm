@@ -3,6 +3,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 use crate::{
     datastore::DatastoreKind,
+    record_table::{RecordTable, StoredRecord},
     utils::{StoreHealth, StoreSearchResult},
 };
 
@@ -18,8 +19,7 @@ const SCORE_SCALE: f64 = 1000.0;
 
 /// Stored full-text document metadata.
 struct FullTextRecord {
-    id: String,
-    token_count: usize,
+    token_count: u32,
     /// Unique terms present in this record, used to remove stale postings.
     terms: Vec<TermId>,
 }
@@ -57,96 +57,118 @@ impl PartialOrd for ScoredRecord {
 /// Records are stored sparsely so deleted ids can leave reusable slots while
 /// postings remain sorted by record index for binary-search intersections.
 pub(crate) struct FullTextDatastore {
-    records: Vec<Option<FullTextRecord>>,
-    id_to_index: HashMap<String, usize>,
+    records: RecordTable<FullTextRecord>,
     term_to_id: HashMap<String, TermId>,
     /// Posting lists indexed by `TermId`; each list is sorted by `record_idx`.
     postings: Vec<Vec<Posting>>,
-    /// Vacant record slots that can be reused on future inserts.
-    free_indices: Vec<usize>,
-    live_record_count: usize,
     total_token_count: usize,
     /// Total token occurrences across live records, used as a quick index-size
     /// health metric.
     posting_occurrence_count: usize,
+    bulk_loading: bool,
 }
 
 impl FullTextDatastore {
     /// Creates an empty full-text datastore.
     pub(crate) fn new() -> Self {
         FullTextDatastore {
-            records: Vec::new(),
-            id_to_index: HashMap::new(),
+            records: RecordTable::new(),
             term_to_id: HashMap::new(),
             postings: Vec::new(),
-            free_indices: Vec::new(),
-            live_record_count: 0,
             total_token_count: 0,
             posting_occurrence_count: 0,
+            bulk_loading: false,
         }
     }
 
     /// Inserts or replaces a record and updates the inverted index.
     pub(crate) fn upsert(&mut self, id: String, text: String) {
-        let idx = self.allocate_record_slot(&id);
-        let record_idx = as_record_idx(idx);
-        // Accumulate per-record frequencies first so each posting list receives
-        // one entry per term, not one entry per token occurrence.
-        let mut record_postings = HashMap::<TermId, u32>::new();
-        let mut token_count = 0;
-
-        tokenize_each(&text, |term, _, _| {
-            token_count += 1;
-            let term_id = self.intern_term(term);
-            *record_postings.entry(term_id).or_default() += 1;
-        });
-
-        // Store only unique terms so replacement/deletion can remove stale
-        // entries from the affected posting lists.
-        let terms = record_postings.keys().copied().collect::<Vec<_>>();
-
-        for (term, term_frequency) in record_postings {
-            let postings = self.postings_for_term_mut(term);
-            insert_posting(postings, record_idx, term_frequency);
+        let (record_postings, token_count) = self.build_record_postings(&text);
+        let terms = record_postings
+            .iter()
+            .map(|(term, _)| *term)
+            .collect::<Vec<_>>();
+        let (idx, replaced) = self
+            .records
+            .upsert(id, FullTextRecord { token_count, terms });
+        if let Some(record) = replaced {
+            self.remove_record_from_index(idx, record);
         }
 
-        self.id_to_index.insert(id.clone(), idx);
-        self.live_record_count += 1;
-        self.total_token_count += token_count;
-        self.posting_occurrence_count += token_count;
-        self.records[idx] = Some(FullTextRecord {
-            id,
-            token_count,
-            terms,
-        });
+        let record_idx = as_record_idx(idx);
+        let bulk_loading = self.bulk_loading;
+        for (term, term_frequency) in record_postings {
+            let postings = self.postings_for_term_mut(term);
+            if bulk_loading {
+                postings.push(Posting {
+                    record_idx,
+                    term_frequency,
+                });
+            } else {
+                insert_posting(postings, record_idx, term_frequency);
+            }
+        }
+
+        self.total_token_count += token_count as usize;
+        self.posting_occurrence_count += token_count as usize;
     }
 
     /// Deletes a record and makes its slot available for reuse.
     pub(crate) fn delete(&mut self, id: &str) {
-        if let Some(idx) = self.remove_existing(id) {
-            self.free_indices.push(idx);
+        if let Some((idx, record)) = self.records.delete(id) {
+            self.remove_record_from_index(idx, record);
+        }
+    }
+
+    /// Removes every record whose external id starts with `prefix`.
+    pub(crate) fn delete_by_prefix(&mut self, prefix: &str) {
+        let ids = self
+            .records
+            .record_ids()
+            .into_iter()
+            .filter(|id| id.starts_with(prefix))
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.delete(&id);
         }
     }
 
     /// Removes all records, terms, postings, and reusable slots.
     pub(crate) fn clear(&mut self) {
         self.records.clear();
-        self.id_to_index.clear();
         self.term_to_id.clear();
         self.postings.clear();
-        self.free_indices.clear();
-        self.live_record_count = 0;
         self.total_token_count = 0;
         self.posting_occurrence_count = 0;
+        self.bulk_loading = false;
+    }
+
+    /// Starts a bulk rebuild. Records inserted before `finish_bulk_load` use
+    /// append-only posting writes and are sorted once at the end.
+    pub(crate) fn begin_bulk_load(&mut self) {
+        self.clear();
+        self.bulk_loading = true;
+    }
+
+    /// Finalizes a bulk rebuild by restoring sorted posting-list invariants.
+    pub(crate) fn finish_bulk_load(&mut self) {
+        if !self.bulk_loading {
+            return;
+        }
+
+        for postings in &mut self.postings {
+            postings.sort_unstable_by_key(|posting| posting.record_idx);
+        }
+        self.bulk_loading = false;
     }
 
     /// Builds a lightweight health snapshot used by tests and diagnostics.
     pub(crate) fn health(&self) -> StoreHealth {
         StoreHealth::new(
             DatastoreKind::FullText.as_str(),
-            self.live_record_count,
-            self.records.len().saturating_sub(self.live_record_count),
-            self.id_to_index.keys().cloned().collect(),
+            self.records.live_record_count(),
+            self.records.tombstone_count(),
+            self.records.record_ids(),
             self.postings.len(),
             self.posting_occurrence_count,
         )
@@ -155,6 +177,10 @@ impl FullTextDatastore {
     /// Searches for documents containing every query term and ranks them using
     /// BM25.
     pub(crate) fn search(&self, query: &str, max_results: usize) -> Vec<StoreSearchResult> {
+        if self.bulk_loading {
+            return Vec::new();
+        }
+
         let query_terms = self.parse_query_terms(query);
         if query_terms.is_empty() {
             return Vec::new();
@@ -167,7 +193,7 @@ impl FullTextDatastore {
             return Vec::new();
         };
 
-        let live_docs = self.live_record_count.max(1);
+        let live_docs = self.records.live_record_count().max(1);
         let avg_len = self.total_token_count as f64 / live_docs as f64;
         let mut scored_records = BinaryHeap::<ScoredRecord>::new();
 
@@ -183,11 +209,7 @@ impl FullTextDatastore {
                 continue;
             }
 
-            let Some(record) = self
-                .records
-                .get(idx as usize)
-                .and_then(|record| record.as_ref())
-            else {
+            let Some(record) = self.records.get(idx as usize) else {
                 continue;
             };
 
@@ -195,7 +217,7 @@ impl FullTextDatastore {
                 &mut scored_records,
                 ScoredRecord {
                     record_idx: idx,
-                    score: self.score_record(record, idx, &postings, live_docs, avg_len),
+                    score: self.score_record(&record.value, idx, &postings, live_docs, avg_len),
                 },
                 max_results,
             );
@@ -215,43 +237,32 @@ impl FullTextDatastore {
             .collect()
     }
 
-    /// Chooses a record slot, removing an existing record first when the id is
-    /// being replaced.
-    fn allocate_record_slot(&mut self, id: &str) -> usize {
-        if let Some(idx) = self.remove_existing(id) {
-            idx
-        } else if let Some(idx) = self.free_indices.pop() {
-            idx
-        } else {
-            let idx = self.records.len();
-            self.records.push(None);
-            idx
+    /// Removes a live record from all index side structures.
+    fn remove_record_from_index(&mut self, idx: usize, record: StoredRecord<FullTextRecord>) {
+        self.total_token_count = self
+            .total_token_count
+            .saturating_sub(record.value.token_count as usize);
+        self.posting_occurrence_count = self
+            .posting_occurrence_count
+            .saturating_sub(record.value.token_count as usize);
+        let record_idx = as_record_idx(idx);
+        for term in &record.value.terms {
+            self.remove_postings_for_record(*term, record_idx);
         }
-    }
-
-    /// Removes a live record and all of its postings, returning its old slot.
-    fn remove_existing(&mut self, id: &str) -> Option<usize> {
-        let idx = self.id_to_index.remove(id)?;
-
-        if let Some(record) = self.records.get_mut(idx).and_then(Option::take) {
-            self.live_record_count = self.live_record_count.saturating_sub(1);
-            self.total_token_count = self.total_token_count.saturating_sub(record.token_count);
-            self.posting_occurrence_count = self
-                .posting_occurrence_count
-                .saturating_sub(record.token_count);
-            let record_idx = as_record_idx(idx);
-            for term in &record.terms {
-                self.remove_postings_for_record(*term, record_idx);
-            }
-        }
-
-        Some(idx)
     }
 
     /// Removes a record from one sorted posting list.
     fn remove_postings_for_record(&mut self, term: TermId, idx: RecordIdx) {
         if let Some(posting) = self.postings.get_mut(term as usize) {
-            if let Ok(posting_idx) = posting.binary_search_by_key(&idx, |entry| entry.record_idx) {
+            let posting_idx = if self.bulk_loading {
+                posting.iter().position(|entry| entry.record_idx == idx)
+            } else {
+                posting
+                    .binary_search_by_key(&idx, |entry| entry.record_idx)
+                    .ok()
+            };
+
+            if let Some(posting_idx) = posting_idx {
                 posting.remove(posting_idx);
             }
         }
@@ -300,6 +311,29 @@ impl FullTextDatastore {
         terms
     }
 
+    /// Builds one compact posting entry per unique term in a record.
+    fn build_record_postings(&mut self, text: &str) -> (Vec<(TermId, u32)>, u32) {
+        let mut terms = Vec::<TermId>::new();
+        tokenize_each(text, |term, _, _| {
+            terms.push(self.intern_term(term));
+        });
+        terms.sort_unstable();
+
+        let token_count = as_token_count(terms.len());
+        let mut postings = Vec::with_capacity(terms.len());
+        for term in terms {
+            if let Some((last_term, term_frequency)) = postings.last_mut() {
+                if *last_term == term {
+                    *term_frequency += 1;
+                    continue;
+                }
+            }
+            postings.push((term, 1));
+        }
+
+        (postings, token_count)
+    }
+
     /// Computes the integer BM25 score for one candidate record.
     fn score_record(
         &self,
@@ -319,7 +353,7 @@ impl FullTextDatastore {
             score += bm25_score(
                 posting.term_frequency as usize,
                 term_postings.len(),
-                record.token_count,
+                record.token_count as usize,
                 live_docs,
                 avg_len,
             );
@@ -334,19 +368,15 @@ impl FullTextDatastore {
         scored: ScoredRecord,
         _postings: &[&[Posting]],
     ) -> Option<StoreSearchResult> {
-        let record = self
-            .records
-            .get(scored.record_idx as usize)
-            .and_then(|record| record.as_ref())?;
-        Some(StoreSearchResult::new(record.id.clone(), scored.score))
+        let record = self.records.get(scored.record_idx as usize)?;
+        Some(StoreSearchResult::new(record.id.to_string(), scored.score))
     }
 
     /// Returns a record id for deterministic tie-breaking during sorting.
     fn record_id(&self, record_idx: RecordIdx) -> &str {
         self.records
             .get(record_idx as usize)
-            .and_then(|record| record.as_ref())
-            .map_or("", |record| record.id.as_str())
+            .map_or("", |record| record.id.as_ref())
     }
 }
 
@@ -460,6 +490,11 @@ fn as_record_idx(idx: usize) -> RecordIdx {
     u32::try_from(idx).expect("full-text record count exceeded u32::MAX")
 }
 
+/// Converts a record token length into the compact per-record type.
+fn as_token_count(count: usize) -> u32 {
+    u32::try_from(count).expect("full-text record token count exceeded u32::MAX")
+}
+
 /// Converts a posting-list vector index into the compact term id type.
 fn as_term_id(idx: usize) -> TermId {
     u32::try_from(idx).expect("full-text term count exceeded u32::MAX")
@@ -503,5 +538,31 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
         assert!(results[0].highlight_ranges.is_empty());
+    }
+
+    #[test]
+    fn bulk_load_finalizes_queryable_postings() {
+        let mut store = FullTextDatastore::new();
+        store.begin_bulk_load();
+        store.upsert("a".to_string(), "apple pie".to_string());
+        store.upsert("b".to_string(), "banana pie".to_string());
+        store.finish_bulk_load();
+
+        let results = store.search("apple pie", 10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "a");
+    }
+
+    #[test]
+    fn bulk_load_rejects_searches_before_finalization() {
+        let mut store = FullTextDatastore::new();
+        store.begin_bulk_load();
+        store.upsert("a".to_string(), "apple pie".to_string());
+        store.upsert("b".to_string(), "banana pie".to_string());
+
+        let results = store.search("banana pie", 10);
+
+        assert!(results.is_empty());
     }
 }
