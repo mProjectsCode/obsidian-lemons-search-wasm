@@ -3,52 +3,50 @@ use std::collections::BinaryHeap;
 use nucleo_matcher::{Utf32Str, Utf32String};
 use web_sys::js_sys;
 
+/// Searchable string stored in the representation expected by `nucleo_matcher`.
 pub struct NumberedString {
-    index: usize,
     utf32: Utf32String,
 }
 
 impl NumberedString {
-    pub fn new(index: usize, string: String) -> Self {
+    /// Converts a Rust string into the UTF-32 representation expected by
+    /// `nucleo_matcher`.
+    pub fn new(string: String) -> Self {
         NumberedString {
-            index,
             utf32: Utf32String::from(string),
         }
     }
 
     #[inline]
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
-    #[inline]
+    /// Borrows the matcher-ready UTF-32 string.
     pub fn utf32str(&self) -> Utf32Str<'_> {
         self.utf32.slice(..)
-    }
-
-    pub fn string(&self) -> String {
-        self.utf32.to_string()
     }
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Score/index pair with reversed ordering for bounded min-heap behavior.
 pub struct ScoredIndex(u32, usize);
 
 impl ScoredIndex {
+    /// Creates a scored index entry.
     pub fn new(score: u32, index: usize) -> Self {
         ScoredIndex(score, index)
     }
 
     #[inline]
+    /// Returns the match score.
     pub fn score(&self) -> u32 {
         self.0
     }
 
     #[inline]
+    /// Returns the associated data index.
     pub fn idx(&self) -> usize {
         self.1
     }
 
+    /// Maintains a heap containing only the highest scoring entries.
     pub fn push_top_score(heap: &mut BinaryHeap<Self>, scored_idx: Self, max_results: usize) {
         if heap.len() < max_results {
             heap.push(scored_idx);
@@ -89,6 +87,7 @@ impl Ord for ScoredIndex {
     }
 }
 
+/// Converts sorted character indices into `[start, end)` range pairs.
 fn compact_highlight_ranges(indices: &[u32]) -> Vec<u32> {
     if indices.is_empty() {
         return Vec::new();
@@ -119,37 +118,7 @@ fn compact_highlight_ranges(indices: &[u32]) -> Vec<u32> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SearchResult {
-    pub index: usize,
-    pub highlight_ranges: Vec<u32>,
-}
-
-impl SearchResult {
-    pub fn new(index: usize) -> Self {
-        SearchResult {
-            index,
-            highlight_ranges: Vec::new(),
-        }
-    }
-
-    pub fn new_from_highlight_ranges(index: usize, highlight_ranges: &[u32]) -> Self {
-        SearchResult {
-            index,
-            highlight_ranges: compact_highlight_ranges(highlight_ranges),
-        }
-    }
-
-    pub fn into_js_object(self) -> js_sys::Object {
-        let obj = js_sys::Object::new();
-        let ranges = js_sys::Uint32Array::from(self.highlight_ranges.as_slice());
-        let _ = js_sys::Reflect::set(&obj, &"index".into(), &self.index.into());
-        let _ = js_sys::Reflect::set(&obj, &"r".into(), &ranges.into());
-
-        obj
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
+/// Datastore search result addressed by external record id.
 pub struct StoreSearchResult {
     pub id: String,
     pub score: u32,
@@ -157,6 +126,7 @@ pub struct StoreSearchResult {
 }
 
 impl StoreSearchResult {
+    /// Builds a result without highlight ranges.
     pub fn new(id: String, score: u32) -> Self {
         StoreSearchResult {
             id,
@@ -165,6 +135,7 @@ impl StoreSearchResult {
         }
     }
 
+    /// Builds a result and compacts individual matched indices into ranges.
     pub fn new_from_ranges(id: String, score: u32, highlight_ranges: &[u32]) -> Self {
         StoreSearchResult {
             id,
@@ -173,6 +144,7 @@ impl StoreSearchResult {
         }
     }
 
+    /// Converts this result into the compact JavaScript object shape.
     pub fn into_js_object(self) -> js_sys::Object {
         let obj = js_sys::Object::new();
         let ranges = js_sys::Uint32Array::from(self.highlight_ranges.as_slice());
@@ -185,6 +157,7 @@ impl StoreSearchResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Diagnostic snapshot for a datastore.
 pub struct StoreHealth {
     pub exists: bool,
     pub kind: String,
@@ -196,6 +169,7 @@ pub struct StoreHealth {
 }
 
 impl StoreHealth {
+    /// Builds a health snapshot for an existing datastore.
     pub fn new(
         kind: &str,
         live_records: usize,
@@ -216,6 +190,7 @@ impl StoreHealth {
         }
     }
 
+    /// Builds the health response for a missing datastore id.
     pub fn missing() -> Self {
         StoreHealth {
             exists: false,
@@ -228,6 +203,8 @@ impl StoreHealth {
         }
     }
 
+    /// Converts this snapshot into the JavaScript object shape expected by the
+    /// TypeScript side.
     pub fn into_js_object(self) -> js_sys::Object {
         let obj = js_sys::Object::new();
         let ids = js_sys::Array::new();

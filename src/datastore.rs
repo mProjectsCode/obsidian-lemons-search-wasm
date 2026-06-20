@@ -5,12 +5,15 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Selects the search implementation backing a datastore.
 pub(crate) enum DatastoreKind {
     Fuzzy,
     FullText,
 }
 
 impl DatastoreKind {
+    /// Parses the JavaScript-facing store kind, defaulting to fuzzy search for
+    /// unknown values to preserve the legacy behavior.
     pub(crate) fn parse(kind: &str) -> Self {
         match kind {
             "fullText" => DatastoreKind::FullText,
@@ -18,6 +21,7 @@ impl DatastoreKind {
         }
     }
 
+    /// Returns the stable string used in diagnostics and health checks.
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             DatastoreKind::Fuzzy => "fuzzy",
@@ -26,12 +30,14 @@ impl DatastoreKind {
     }
 }
 
+/// Type-erased datastore wrapper used by the wasm-facing engine.
 pub(crate) enum Datastore {
     Fuzzy(FuzzyDatastore),
     FullText(FullTextDatastore),
 }
 
 impl Datastore {
+    /// Builds a concrete datastore for the requested implementation.
     pub(crate) fn new(kind: DatastoreKind) -> Self {
         match kind {
             DatastoreKind::Fuzzy => Datastore::Fuzzy(FuzzyDatastore::new()),
@@ -74,6 +80,10 @@ impl Datastore {
         }
     }
 
+    /// Dispatches a search to the matching datastore and session state.
+    ///
+    /// A session created for one store kind is not reusable for another kind;
+    /// mismatches return no results instead of panicking.
     pub(crate) fn search(
         &self,
         session: &mut SearchSession,
@@ -95,6 +105,10 @@ impl Datastore {
     }
 }
 
+/// Per-consumer search state tied to a single datastore.
+///
+/// Fuzzy search keeps incremental narrowing state here so separate UI clients
+/// can search the same store without sharing query history.
 pub(crate) struct SearchSession {
     pub(crate) store_id: String,
     kind: DatastoreKind,
@@ -102,6 +116,8 @@ pub(crate) struct SearchSession {
 }
 
 impl SearchSession {
+    /// Creates a session with any implementation-specific state required by the
+    /// target datastore.
     pub(crate) fn new(store_id: String, kind: DatastoreKind) -> Self {
         SearchSession {
             store_id,
@@ -113,6 +129,7 @@ impl SearchSession {
         }
     }
 
+    /// Clears cached query state after the underlying datastore changes.
     pub(crate) fn reset(&mut self) {
         if let Some(state) = self.fuzzy.as_mut() {
             state.reset();

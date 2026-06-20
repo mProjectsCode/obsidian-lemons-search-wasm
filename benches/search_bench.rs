@@ -1,4 +1,4 @@
-use lemons_search::Search;
+use lemons_search::SearchEngine;
 use std::hint::black_box;
 use wasm_bindgen_test::{wasm_bindgen_bench, Criterion};
 
@@ -8,6 +8,7 @@ const DEFAULT_PATH_DEPTH: usize = 5;
 const DEFAULT_SEGMENT_LEN: usize = 10;
 
 #[derive(Debug, Clone, Copy)]
+/// Runtime shape of the generated benchmark workload.
 struct BenchConfig {
     cases: usize,
     queries: usize,
@@ -16,6 +17,7 @@ struct BenchConfig {
 }
 
 impl BenchConfig {
+    /// Reads compile-time environment overrides used by wasm benchmark runs.
     fn from_compile_env() -> Self {
         Self {
             cases: parse_env_usize(option_env!("LEMONS_BENCH_CASES"), DEFAULT_CASES),
@@ -31,6 +33,7 @@ impl BenchConfig {
     }
 }
 
+/// Parses a positive `usize` from an optional compile-time environment value.
 fn parse_env_usize(value: Option<&'static str>, default: usize) -> usize {
     value
         .and_then(|v| v.parse::<usize>().ok())
@@ -39,12 +42,14 @@ fn parse_env_usize(value: Option<&'static str>, default: usize) -> usize {
 }
 
 #[derive(Clone, Copy)]
+/// Controls whether benchmark records look like full paths or filenames.
 enum Mode {
     FilePath,
     FileName,
 }
 
 #[derive(Clone, Copy)]
+/// Controls the query pattern used by a benchmark case.
 enum QueryScenario {
     Mixed,
     IncrementalTyping,
@@ -78,6 +83,7 @@ const TITLE_HINTS: &[&str] = &[
     "playbook",
 ];
 
+/// Builds deterministic pseudo-file data for repeatable benchmark runs.
 fn build_dataset(config: BenchConfig, mode: Mode) -> Vec<String> {
     (0..config.cases)
         .map(|i| {
@@ -98,6 +104,8 @@ fn build_dataset(config: BenchConfig, mode: Mode) -> Vec<String> {
             match mode {
                 Mode::FileName => file_name,
                 Mode::FilePath => {
+                    // Capacity is approximate; it keeps large benchmark setup
+                    // from measuring repeated path buffer growth.
                     let mut path =
                         String::with_capacity(config.path_depth * (config.segment_len + 8));
                     path.push_str(root);
@@ -128,8 +136,10 @@ fn build_dataset(config: BenchConfig, mode: Mode) -> Vec<String> {
         .collect()
 }
 
+/// Builds a mix of prefix, composite, and noisy queries from the dataset.
 fn build_mixed_queries(dataset: &[String], config: BenchConfig) -> Vec<String> {
     let query_count = config.queries.min(dataset.len()).max(1);
+    // Spread samples through the dataset instead of measuring adjacent records.
     let step = (dataset.len() / query_count).max(1);
 
     (0..query_count)
@@ -171,8 +181,11 @@ fn build_mixed_queries(dataset: &[String], config: BenchConfig) -> Vec<String> {
         .collect()
 }
 
+/// Builds query sequences that model a user extending the same filename prefix.
 fn build_incremental_typing_queries(dataset: &[String], config: BenchConfig) -> Vec<String> {
     let mut queries = Vec::with_capacity(config.queries.max(1));
+    // Use a bounded number of seeds so the scenario emphasizes repeated prefix
+    // narrowing instead of unrelated one-off queries.
     let seed_count = (dataset.len() / 300).max(1).min(64);
     let stride = (dataset.len() / seed_count).max(1);
 
@@ -201,6 +214,7 @@ fn build_incremental_typing_queries(dataset: &[String], config: BenchConfig) -> 
     queries
 }
 
+/// Builds benchmark queries for the selected scenario.
 fn build_queries(dataset: &[String], config: BenchConfig, scenario: QueryScenario) -> Vec<String> {
     match scenario {
         QueryScenario::Mixed => build_mixed_queries(dataset, config),
@@ -208,10 +222,13 @@ fn build_queries(dataset: &[String], config: BenchConfig, scenario: QueryScenari
     }
 }
 
+/// Generates deterministic lowercase tokens without external randomness.
 fn make_token(index: usize, segment_len: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
 
     let mut token = String::with_capacity(segment_len);
+    // LCG constants provide cheap, deterministic character variation across
+    // benchmark records; cryptographic quality is irrelevant here.
     let mut state = index as u64 * 6364136223846793005u64 + 1442695040888963407u64;
 
     for _ in 0..segment_len {
@@ -223,20 +240,25 @@ fn make_token(index: usize, segment_len: usize) -> String {
     token
 }
 
+/// Runs one benchmark case against a freshly built fuzzy datastore.
 fn run_search_bench(c: &mut Criterion, mode: Mode, scenario: QueryScenario, label: &str) {
     let config = BenchConfig::from_compile_env();
     let dataset = build_dataset(config, mode);
     let queries = build_queries(&dataset, config, scenario);
 
     c.bench_function(label, |b| {
-        let mut search = Search::new();
-        search.update_index(dataset.clone());
+        let mut engine = SearchEngine::new();
+        let store_id = engine.create_datastore("fuzzy");
+        for (idx, text) in dataset.iter().enumerate() {
+            engine.upsert_record(&store_id, &idx.to_string(), text);
+        }
+        let session_id = engine.create_session(&store_id);
         let mut query_idx = 0usize;
 
         b.iter(|| {
             let query = &queries[query_idx % queries.len()];
             query_idx = query_idx.wrapping_add(1);
-            black_box(search.search(query));
+            black_box(engine.search_session(&session_id, query));
         });
     });
 }

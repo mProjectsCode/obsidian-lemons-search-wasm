@@ -9,22 +9,29 @@ use crate::{
 type RecordIdx = u32;
 type TermId = u32;
 
+/// BM25 term-frequency saturation constant.
 const BM25_K1: f64 = 1.2;
+/// BM25 document-length normalization constant.
 const BM25_B: f64 = 0.75;
+/// Multiplier used to expose floating BM25 scores as stable integer scores.
 const SCORE_SCALE: f64 = 1000.0;
 
+/// Stored full-text document metadata.
 struct FullTextRecord {
     id: String,
     token_count: usize,
+    /// Unique terms present in this record, used to remove stale postings.
     terms: Vec<TermId>,
 }
 
+/// A single term occurrence summary inside an inverted-index posting list.
 struct Posting {
     record_idx: RecordIdx,
     term_frequency: u32,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+/// Heap entry for retaining the highest-scoring records.
 struct ScoredRecord {
     record_idx: RecordIdx,
     score: u32,
@@ -45,18 +52,27 @@ impl PartialOrd for ScoredRecord {
     }
 }
 
+/// BM25 full-text datastore with an inverted index.
+///
+/// Records are stored sparsely so deleted ids can leave reusable slots while
+/// postings remain sorted by record index for binary-search intersections.
 pub(crate) struct FullTextDatastore {
     records: Vec<Option<FullTextRecord>>,
     id_to_index: HashMap<String, usize>,
     term_to_id: HashMap<String, TermId>,
+    /// Posting lists indexed by `TermId`; each list is sorted by `record_idx`.
     postings: Vec<Vec<Posting>>,
+    /// Vacant record slots that can be reused on future inserts.
     free_indices: Vec<usize>,
     live_record_count: usize,
     total_token_count: usize,
+    /// Total token occurrences across live records, used as a quick index-size
+    /// health metric.
     posting_occurrence_count: usize,
 }
 
 impl FullTextDatastore {
+    /// Creates an empty full-text datastore.
     pub(crate) fn new() -> Self {
         FullTextDatastore {
             records: Vec::new(),
@@ -70,9 +86,12 @@ impl FullTextDatastore {
         }
     }
 
+    /// Inserts or replaces a record and updates the inverted index.
     pub(crate) fn upsert(&mut self, id: String, text: String) {
         let idx = self.allocate_record_slot(&id);
         let record_idx = as_record_idx(idx);
+        // Accumulate per-record frequencies first so each posting list receives
+        // one entry per term, not one entry per token occurrence.
         let mut record_postings = HashMap::<TermId, u32>::new();
         let mut token_count = 0;
 
@@ -82,6 +101,8 @@ impl FullTextDatastore {
             *record_postings.entry(term_id).or_default() += 1;
         });
 
+        // Store only unique terms so replacement/deletion can remove stale
+        // entries from the affected posting lists.
         let terms = record_postings.keys().copied().collect::<Vec<_>>();
 
         for (term, term_frequency) in record_postings {
@@ -100,12 +121,14 @@ impl FullTextDatastore {
         });
     }
 
+    /// Deletes a record and makes its slot available for reuse.
     pub(crate) fn delete(&mut self, id: &str) {
         if let Some(idx) = self.remove_existing(id) {
             self.free_indices.push(idx);
         }
     }
 
+    /// Removes all records, terms, postings, and reusable slots.
     pub(crate) fn clear(&mut self) {
         self.records.clear();
         self.id_to_index.clear();
@@ -117,6 +140,7 @@ impl FullTextDatastore {
         self.posting_occurrence_count = 0;
     }
 
+    /// Builds a lightweight health snapshot used by tests and diagnostics.
     pub(crate) fn health(&self) -> StoreHealth {
         StoreHealth::new(
             DatastoreKind::FullText.as_str(),
@@ -128,6 +152,8 @@ impl FullTextDatastore {
         )
     }
 
+    /// Searches for documents containing every query term and ranks them using
+    /// BM25.
     pub(crate) fn search(&self, query: &str, max_results: usize) -> Vec<StoreSearchResult> {
         let query_terms = self.parse_query_terms(query);
         if query_terms.is_empty() {
@@ -145,6 +171,8 @@ impl FullTextDatastore {
         let avg_len = self.total_token_count as f64 / live_docs as f64;
         let mut scored_records = BinaryHeap::<ScoredRecord>::new();
 
+        // Start with the rarest term's posting list; any matching record must
+        // also be present in every other query term's posting list.
         for candidate in *smallest_posting {
             let idx = candidate.record_idx;
             if !postings
@@ -187,6 +215,8 @@ impl FullTextDatastore {
             .collect()
     }
 
+    /// Chooses a record slot, removing an existing record first when the id is
+    /// being replaced.
     fn allocate_record_slot(&mut self, id: &str) -> usize {
         if let Some(idx) = self.remove_existing(id) {
             idx
@@ -199,6 +229,7 @@ impl FullTextDatastore {
         }
     }
 
+    /// Removes a live record and all of its postings, returning its old slot.
     fn remove_existing(&mut self, id: &str) -> Option<usize> {
         let idx = self.id_to_index.remove(id)?;
 
@@ -217,6 +248,7 @@ impl FullTextDatastore {
         Some(idx)
     }
 
+    /// Removes a record from one sorted posting list.
     fn remove_postings_for_record(&mut self, term: TermId, idx: RecordIdx) {
         if let Some(posting) = self.postings.get_mut(term as usize) {
             if let Ok(posting_idx) = posting.binary_search_by_key(&idx, |entry| entry.record_idx) {
@@ -225,6 +257,7 @@ impl FullTextDatastore {
         }
     }
 
+    /// Resolves query terms to posting lists ordered from rarest to most common.
     fn lookup_query_postings(&self, query_terms: &[TermId]) -> Option<Vec<&[Posting]>> {
         let mut postings = Vec::with_capacity(query_terms.len());
         for term in query_terms {
@@ -238,6 +271,8 @@ impl FullTextDatastore {
         Some(postings)
     }
 
+    /// Returns a stable numeric id for a term, creating a posting list on first
+    /// sighting.
     fn intern_term(&mut self, term: String) -> TermId {
         if let Some(term_id) = self.term_to_id.get(&term) {
             return *term_id;
@@ -249,10 +284,12 @@ impl FullTextDatastore {
         term_id
     }
 
+    /// Returns the mutable posting list for an already interned term.
     fn postings_for_term_mut(&mut self, term: TermId) -> &mut Vec<Posting> {
         &mut self.postings[term as usize]
     }
 
+    /// Parses, resolves, sorts, and deduplicates query terms.
     fn parse_query_terms(&self, query: &str) -> Vec<TermId> {
         let mut terms = tokenize_terms(query)
             .into_iter()
@@ -263,6 +300,7 @@ impl FullTextDatastore {
         terms
     }
 
+    /// Computes the integer BM25 score for one candidate record.
     fn score_record(
         &self,
         record: &FullTextRecord,
@@ -290,6 +328,7 @@ impl FullTextDatastore {
         (score * SCORE_SCALE).round() as u32
     }
 
+    /// Converts a scored record into the JavaScript-facing result shape.
     fn build_search_result(
         &self,
         scored: ScoredRecord,
@@ -302,6 +341,7 @@ impl FullTextDatastore {
         Some(StoreSearchResult::new(record.id.clone(), scored.score))
     }
 
+    /// Returns a record id for deterministic tie-breaking during sorting.
     fn record_id(&self, record_idx: RecordIdx) -> &str {
         self.records
             .get(record_idx as usize)
@@ -310,6 +350,7 @@ impl FullTextDatastore {
     }
 }
 
+/// Computes the BM25 contribution of one matched term.
 fn bm25_score(
     term_frequency: usize,
     document_frequency: usize,
@@ -326,6 +367,7 @@ fn bm25_score(
     idf * ((tf * (BM25_K1 + 1.0)) / denom)
 }
 
+/// Maintains a bounded heap containing only the top scoring records.
 fn push_top_scored_record(
     heap: &mut BinaryHeap<ScoredRecord>,
     scored_record: ScoredRecord,
@@ -346,6 +388,7 @@ fn push_top_scored_record(
     }
 }
 
+/// Inserts or replaces a posting while preserving record-index sort order.
 fn insert_posting(postings: &mut Vec<Posting>, record_idx: RecordIdx, term_frequency: u32) {
     if postings
         .last()
@@ -370,6 +413,7 @@ fn insert_posting(postings: &mut Vec<Posting>, record_idx: RecordIdx, term_frequ
     }
 }
 
+/// Finds a record inside a sorted posting list.
 fn find_posting(postings: &[Posting], record_idx: RecordIdx) -> Option<&Posting> {
     postings
         .binary_search_by_key(&record_idx, |posting| posting.record_idx)
@@ -377,9 +421,12 @@ fn find_posting(postings: &[Posting], record_idx: RecordIdx) -> Option<&Posting>
         .map(|idx| &postings[idx])
 }
 
+/// Tokenizes text into lowercase alphanumeric terms and reports character
+/// offsets for callers that need positional data.
 fn tokenize_each(text: &str, mut emit: impl FnMut(String, u32, u32)) {
     let mut term = String::new();
     let mut start = 0_u32;
+    // Offsets are counted in Unicode scalar values to match `chars()` traversal.
     let mut current = 0_u32;
 
     for ch in text.chars() {
@@ -401,16 +448,19 @@ fn tokenize_each(text: &str, mut emit: impl FnMut(String, u32, u32)) {
     }
 }
 
+/// Returns only the normalized terms from `tokenize_each`.
 fn tokenize_terms(text: &str) -> Vec<String> {
     let mut terms = Vec::<String>::new();
     tokenize_each(text, |term, _, _| terms.push(term));
     terms
 }
 
+/// Converts a sparse record vector index into the compact posting-list type.
 fn as_record_idx(idx: usize) -> RecordIdx {
     u32::try_from(idx).expect("full-text record count exceeded u32::MAX")
 }
 
+/// Converts a posting-list vector index into the compact term id type.
 fn as_term_id(idx: usize) -> TermId {
     u32::try_from(idx).expect("full-text term count exceeded u32::MAX")
 }
