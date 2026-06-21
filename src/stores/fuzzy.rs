@@ -6,9 +6,11 @@ use nucleo_matcher::{
 };
 
 use crate::{
-    datastore::DatastoreKind,
-    record_table::RecordTable,
-    utils::{NumberedString, ScoredIndex, StoreHealth, StoreSearchResult},
+    core::{
+        matcher_text::MatcherText, record_table::RecordTable, search_result::SearchResult,
+        store_health::DatastoreHealth, top_scores::ScoredRecordIndex,
+    },
+    stores::DatastoreKind,
 };
 
 #[derive(Default)]
@@ -32,7 +34,7 @@ impl FuzzySessionState {
 
 /// One fuzzy-searchable record.
 struct FuzzyRecord {
-    text: NumberedString,
+    text: MatcherText,
 }
 
 /// Sparse fuzzy-search datastore backed by `nucleo_matcher`.
@@ -57,7 +59,7 @@ impl FuzzyDatastore {
         self.records.upsert(
             id,
             FuzzyRecord {
-                text: NumberedString::new(text),
+                text: MatcherText::new(text),
             },
         );
     }
@@ -86,8 +88,8 @@ impl FuzzyDatastore {
     }
 
     /// Builds a lightweight health snapshot used by tests and diagnostics.
-    pub(crate) fn health(&self) -> StoreHealth {
-        StoreHealth::new(
+    pub(crate) fn health(&self) -> DatastoreHealth {
+        DatastoreHealth::new(
             DatastoreKind::Fuzzy.as_str(),
             self.records.live_record_count(),
             self.records.tombstone_count(),
@@ -103,7 +105,7 @@ impl FuzzyDatastore {
         session: &mut FuzzySessionState,
         query: &str,
         max_results: usize,
-    ) -> Vec<StoreSearchResult> {
+    ) -> Vec<SearchResult> {
         reparse_pattern(&mut session.pattern, query);
 
         let Some(pattern) = session.pattern.as_ref() else {
@@ -117,7 +119,7 @@ impl FuzzyDatastore {
                 .records
                 .iter()
                 .take(max_results)
-                .map(|record| StoreSearchResult::new(record.id.to_string(), 0))
+                .map(|record| SearchResult::new(record.id.to_string(), 0))
                 .collect();
         }
 
@@ -131,7 +133,7 @@ impl FuzzyDatastore {
         };
 
         let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
-        let mut scored = BinaryHeap::<ScoredIndex>::with_capacity(max_results);
+        let mut scored = BinaryHeap::<ScoredRecordIndex>::with_capacity(max_results);
         // All matches are retained for future narrowing, while `scored` only
         // keeps the top `max_results` entries needed for this response.
         let mut next_match_ids = Vec::<usize>::with_capacity(candidate_indices.len());
@@ -156,12 +158,13 @@ impl FuzzyDatastore {
             .into_sorted_vec()
             .into_iter()
             .filter_map(|scored_idx| {
-                let record = self.records.get(scored_idx.idx())?;
+                let record = self.records.get(scored_idx.record_index())?;
                 indices.clear();
-                let _ = pattern.indices(record.value.text.utf32str(), &mut matcher, &mut indices);
+                let _ =
+                    pattern.indices(record.value.text.as_utf32_str(), &mut matcher, &mut indices);
                 indices.sort_unstable();
                 indices.dedup();
-                Some(StoreSearchResult::new_from_ranges(
+                Some(SearchResult::with_highlight_indices(
                     record.id.to_string(),
                     scored_idx.score(),
                     &indices,
@@ -178,18 +181,22 @@ impl FuzzyDatastore {
         pattern: &Pattern,
         matcher: &mut Matcher,
         max_results: usize,
-        scored: &mut BinaryHeap<ScoredIndex>,
+        scored: &mut BinaryHeap<ScoredRecordIndex>,
         next_match_ids: &mut Vec<usize>,
     ) {
         let Some(record) = self.records.get(data_idx) else {
             return;
         };
-        let Some(score) = pattern.score(record.value.text.utf32str(), matcher) else {
+        let Some(score) = pattern.score(record.value.text.as_utf32_str(), matcher) else {
             return;
         };
 
         next_match_ids.push(data_idx);
-        ScoredIndex::push_top_score(scored, ScoredIndex::new(score, data_idx), max_results);
+        ScoredRecordIndex::push_top_score(
+            scored,
+            ScoredRecordIndex::new(score, data_idx),
+            max_results,
+        );
     }
 }
 

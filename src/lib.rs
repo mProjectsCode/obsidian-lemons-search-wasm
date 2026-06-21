@@ -1,9 +1,7 @@
-mod datastore;
+mod core;
 mod engine;
-mod full_text;
-mod fuzzy;
-mod record_table;
-mod utils;
+mod session;
+mod stores;
 
 use wasm_bindgen::prelude::*;
 

@@ -1,56 +1,26 @@
-use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::{
-    datastore::DatastoreKind,
-    record_table::{RecordTable, StoredRecord},
-    utils::{StoreHealth, StoreSearchResult},
+    core::{
+        matcher_text::MatcherText,
+        record_table::{RecordTable, StoredRecord},
+        search_result::SearchResult,
+        store_health::DatastoreHealth,
+        text_tokenizer::tokenize_each,
+    },
+    stores::DatastoreKind,
 };
 
-type RecordIdx = u32;
-type TermId = u32;
-
-/// BM25 term-frequency saturation constant.
-const BM25_K1: f64 = 1.2;
-/// BM25 document-length normalization constant.
-const BM25_B: f64 = 0.75;
-/// Multiplier used to expose floating BM25 scores as stable integer scores.
-const SCORE_SCALE: f64 = 1000.0;
-
-/// Stored full-text document metadata.
-struct FullTextRecord {
-    token_count: u32,
-    /// Unique terms present in this record, used to remove stale postings.
-    terms: Vec<TermId>,
-}
-
-/// A single term occurrence summary inside an inverted-index posting list.
-struct Posting {
-    record_idx: RecordIdx,
-    term_frequency: u32,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-/// Heap entry for retaining the highest-scoring records.
-struct ScoredRecord {
-    record_idx: RecordIdx,
-    score: u32,
-}
-
-impl Ord for ScoredRecord {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .cmp(&other.score)
-            .reverse()
-            .then_with(|| self.record_idx.cmp(&other.record_idx))
-    }
-}
-
-impl PartialOrd for ScoredRecord {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+mod model;
+mod postings;
+mod query;
+mod scoring;
+mod types;
+use model::{ExpandedTerm, FullTextRecord, FullTextTerm, Posting, ScoredRecord};
+use postings::insert_posting;
+use types::{
+    record_index_from_usize, term_id_from_usize, token_count_from_usize, RecordIdx, TermId,
+};
 
 /// BM25 full-text datastore with an inverted index.
 ///
@@ -59,6 +29,7 @@ impl PartialOrd for ScoredRecord {
 pub(crate) struct FullTextDatastore {
     records: RecordTable<FullTextRecord>,
     term_to_id: HashMap<String, TermId>,
+    terms: Vec<FullTextTerm>,
     /// Posting lists indexed by `TermId`; each list is sorted by `record_idx`.
     postings: Vec<Vec<Posting>>,
     total_token_count: usize,
@@ -66,6 +37,7 @@ pub(crate) struct FullTextDatastore {
     /// health metric.
     posting_occurrence_count: usize,
     bulk_loading: bool,
+    fuzzy_search: bool,
 }
 
 impl FullTextDatastore {
@@ -74,11 +46,18 @@ impl FullTextDatastore {
         FullTextDatastore {
             records: RecordTable::new(),
             term_to_id: HashMap::new(),
+            terms: Vec::new(),
             postings: Vec::new(),
             total_token_count: 0,
             posting_occurrence_count: 0,
             bulk_loading: false,
+            fuzzy_search: true,
         }
+    }
+
+    /// Sets whether fuzzy matching is used during search.
+    pub(crate) fn set_fuzzy_search(&mut self, enabled: bool) {
+        self.fuzzy_search = enabled;
     }
 
     /// Inserts or replaces a record and updates the inverted index.
@@ -95,7 +74,7 @@ impl FullTextDatastore {
             self.remove_record_from_index(idx, record);
         }
 
-        let record_idx = as_record_idx(idx);
+        let record_idx = record_index_from_usize(idx);
         let bulk_loading = self.bulk_loading;
         for (term, term_frequency) in record_postings {
             let postings = self.postings_for_term_mut(term);
@@ -137,10 +116,12 @@ impl FullTextDatastore {
     pub(crate) fn clear(&mut self) {
         self.records.clear();
         self.term_to_id.clear();
+        self.terms.clear();
         self.postings.clear();
         self.total_token_count = 0;
         self.posting_occurrence_count = 0;
         self.bulk_loading = false;
+        self.fuzzy_search = true;
     }
 
     /// Starts a bulk rebuild. Records inserted before `finish_bulk_load` use
@@ -163,8 +144,8 @@ impl FullTextDatastore {
     }
 
     /// Builds a lightweight health snapshot used by tests and diagnostics.
-    pub(crate) fn health(&self) -> StoreHealth {
-        StoreHealth::new(
+    pub(crate) fn health(&self) -> DatastoreHealth {
+        DatastoreHealth::new(
             DatastoreKind::FullText.as_str(),
             self.records.live_record_count(),
             self.records.tombstone_count(),
@@ -176,48 +157,61 @@ impl FullTextDatastore {
 
     /// Searches for documents containing every query term and ranks them using
     /// BM25.
-    pub(crate) fn search(&self, query: &str, max_results: usize) -> Vec<StoreSearchResult> {
+    pub(crate) fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
         if self.bulk_loading {
             return Vec::new();
         }
 
-        let query_terms = self.parse_query_terms(query);
-        if query_terms.is_empty() {
+        let Some(query) = self.resolve_query(query) else {
+            return Vec::new();
+        };
+
+        let (positive_groups, negative_groups) = query;
+        if positive_groups.is_empty() {
             return Vec::new();
         }
 
-        let Some(postings) = self.lookup_query_postings(&query_terms) else {
-            return Vec::new();
-        };
-        let Some(smallest_posting) = postings.first() else {
-            return Vec::new();
-        };
-
         let live_docs = self.records.live_record_count().max(1);
         let avg_len = self.total_token_count as f64 / live_docs as f64;
-        let mut scored_records = BinaryHeap::<ScoredRecord>::new();
+        let mut positive_scores = positive_groups
+            .iter()
+            .map(|group| self.score_term_group(group, live_docs, avg_len))
+            .collect::<Vec<_>>();
+        if positive_scores.iter().any(|scores| scores.is_empty()) {
+            return Vec::new();
+        }
+        positive_scores.sort_by_key(|scores| scores.len());
 
-        // Start with the rarest term's posting list; any matching record must
-        // also be present in every other query term's posting list.
-        for candidate in *smallest_posting {
-            let idx = candidate.record_idx;
-            if !postings
-                .iter()
-                .skip(1)
-                .all(|term_postings| find_posting(term_postings, idx).is_some())
+        let excluded_records = self.excluded_records(&negative_groups);
+        let mut scored_records = BinaryHeap::<ScoredRecord>::new();
+        let Some(smallest_scores) = positive_scores.first() else {
+            return Vec::new();
+        };
+
+        // Start with the rarest expanded atom's record set; any matching record
+        // must also be present in every other positive query atom's record set.
+        for (&idx, &base_score) in smallest_scores {
+            if excluded_records.contains(&idx)
+                || !positive_scores
+                    .iter()
+                    .skip(1)
+                    .all(|scores| scores.contains_key(&idx))
             {
                 continue;
             }
 
-            let Some(record) = self.records.get(idx as usize) else {
-                continue;
-            };
+            let score = base_score
+                + positive_scores
+                    .iter()
+                    .skip(1)
+                    .filter_map(|scores| scores.get(&idx))
+                    .sum::<u32>();
 
             push_top_scored_record(
                 &mut scored_records,
                 ScoredRecord {
                     record_idx: idx,
-                    score: self.score_record(&record.value, idx, &postings, live_docs, avg_len),
+                    score,
                 },
                 max_results,
             );
@@ -233,7 +227,7 @@ impl FullTextDatastore {
 
         scored_records
             .into_iter()
-            .filter_map(|scored| self.build_search_result(scored, &postings))
+            .filter_map(|scored| self.build_search_result(scored, &positive_groups))
             .collect()
     }
 
@@ -245,7 +239,7 @@ impl FullTextDatastore {
         self.posting_occurrence_count = self
             .posting_occurrence_count
             .saturating_sub(record.value.token_count as usize);
-        let record_idx = as_record_idx(idx);
+        let record_idx = record_index_from_usize(idx);
         for term in &record.value.terms {
             self.remove_postings_for_record(*term, record_idx);
         }
@@ -268,20 +262,6 @@ impl FullTextDatastore {
         }
     }
 
-    /// Resolves query terms to posting lists ordered from rarest to most common.
-    fn lookup_query_postings(&self, query_terms: &[TermId]) -> Option<Vec<&[Posting]>> {
-        let mut postings = Vec::with_capacity(query_terms.len());
-        for term in query_terms {
-            let term_postings = self.postings.get(*term as usize)?.as_slice();
-            if term_postings.is_empty() {
-                return None;
-            }
-            postings.push(term_postings);
-        }
-        postings.sort_by_key(|term_postings| term_postings.len());
-        Some(postings)
-    }
-
     /// Returns a stable numeric id for a term, creating a posting list on first
     /// sighting.
     fn intern_term(&mut self, term: String) -> TermId {
@@ -289,7 +269,11 @@ impl FullTextDatastore {
             return *term_id;
         }
 
-        let term_id = as_term_id(self.postings.len());
+        let term_id = term_id_from_usize(self.postings.len());
+        self.terms.push(FullTextTerm {
+            text: term.clone(),
+            matcher_text: MatcherText::new(term.clone()),
+        });
         self.term_to_id.insert(term, term_id);
         self.postings.push(Vec::new());
         term_id
@@ -300,17 +284,6 @@ impl FullTextDatastore {
         &mut self.postings[term as usize]
     }
 
-    /// Parses, resolves, sorts, and deduplicates query terms.
-    fn parse_query_terms(&self, query: &str) -> Vec<TermId> {
-        let mut terms = tokenize_terms(query)
-            .into_iter()
-            .filter_map(|term| self.term_to_id.get(&term).copied())
-            .collect::<Vec<_>>();
-        terms.sort_unstable();
-        terms.dedup();
-        terms
-    }
-
     /// Builds one compact posting entry per unique term in a record.
     fn build_record_postings(&mut self, text: &str) -> (Vec<(TermId, u32)>, u32) {
         let mut terms = Vec::<TermId>::new();
@@ -319,7 +292,7 @@ impl FullTextDatastore {
         });
         terms.sort_unstable();
 
-        let token_count = as_token_count(terms.len());
+        let token_count = token_count_from_usize(terms.len());
         let mut postings = Vec::with_capacity(terms.len());
         for term in terms {
             if let Some((last_term, term_frequency)) = postings.last_mut() {
@@ -334,42 +307,18 @@ impl FullTextDatastore {
         (postings, token_count)
     }
 
-    /// Computes the integer BM25 score for one candidate record.
-    fn score_record(
-        &self,
-        record: &FullTextRecord,
-        record_idx: RecordIdx,
-        postings: &[&[Posting]],
-        live_docs: usize,
-        avg_len: f64,
-    ) -> u32 {
-        let mut score = 0.0;
-
-        for term_postings in postings {
-            let Some(posting) = find_posting(term_postings, record_idx) else {
-                continue;
-            };
-
-            score += bm25_score(
-                posting.term_frequency as usize,
-                term_postings.len(),
-                record.token_count as usize,
-                live_docs,
-                avg_len,
-            );
-        }
-
-        (score * SCORE_SCALE).round() as u32
-    }
-
     /// Converts a scored record into the JavaScript-facing result shape.
     fn build_search_result(
         &self,
         scored: ScoredRecord,
-        _postings: &[&[Posting]],
-    ) -> Option<StoreSearchResult> {
+        positive_groups: &[Vec<ExpandedTerm>],
+    ) -> Option<SearchResult> {
         let record = self.records.get(scored.record_idx as usize)?;
-        Some(StoreSearchResult::new(record.id.to_string(), scored.score))
+        Some(SearchResult::with_matched_terms(
+            record.id.to_string(),
+            scored.score,
+            self.matched_terms_for_record(&record.value.terms, positive_groups),
+        ))
     }
 
     /// Returns a record id for deterministic tie-breaking during sorting.
@@ -378,23 +327,6 @@ impl FullTextDatastore {
             .get(record_idx as usize)
             .map_or("", |record| record.id.as_ref())
     }
-}
-
-/// Computes the BM25 contribution of one matched term.
-fn bm25_score(
-    term_frequency: usize,
-    document_frequency: usize,
-    document_len: usize,
-    live_docs: usize,
-    avg_len: f64,
-) -> f64 {
-    let tf = term_frequency as f64;
-    let df = document_frequency as f64;
-    let idf = ((live_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
-    let length = document_len.max(1) as f64;
-    let denom = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * (length / avg_len.max(1.0)));
-
-    idf * ((tf * (BM25_K1 + 1.0)) / denom)
 }
 
 /// Maintains a bounded heap containing only the top scoring records.
@@ -418,91 +350,9 @@ fn push_top_scored_record(
     }
 }
 
-/// Inserts or replaces a posting while preserving record-index sort order.
-fn insert_posting(postings: &mut Vec<Posting>, record_idx: RecordIdx, term_frequency: u32) {
-    if postings
-        .last()
-        .is_none_or(|posting| posting.record_idx < record_idx)
-    {
-        postings.push(Posting {
-            record_idx,
-            term_frequency,
-        });
-        return;
-    }
-
-    match postings.binary_search_by_key(&record_idx, |posting| posting.record_idx) {
-        Ok(idx) => postings[idx].term_frequency = term_frequency,
-        Err(idx) => postings.insert(
-            idx,
-            Posting {
-                record_idx,
-                term_frequency,
-            },
-        ),
-    }
-}
-
-/// Finds a record inside a sorted posting list.
-fn find_posting(postings: &[Posting], record_idx: RecordIdx) -> Option<&Posting> {
-    postings
-        .binary_search_by_key(&record_idx, |posting| posting.record_idx)
-        .ok()
-        .map(|idx| &postings[idx])
-}
-
-/// Tokenizes text into lowercase alphanumeric terms and reports character
-/// offsets for callers that need positional data.
-fn tokenize_each(text: &str, mut emit: impl FnMut(String, u32, u32)) {
-    let mut term = String::new();
-    let mut start = 0_u32;
-    // Offsets are counted in Unicode scalar values to match `chars()` traversal.
-    let mut current = 0_u32;
-
-    for ch in text.chars() {
-        if ch.is_alphanumeric() {
-            if term.is_empty() {
-                start = current;
-            }
-            for lowered in ch.to_lowercase() {
-                term.push(lowered);
-            }
-        } else if !term.is_empty() {
-            emit(std::mem::take(&mut term), start, current);
-        }
-        current += 1;
-    }
-
-    if !term.is_empty() {
-        emit(term, start, current);
-    }
-}
-
-/// Returns only the normalized terms from `tokenize_each`.
-fn tokenize_terms(text: &str) -> Vec<String> {
-    let mut terms = Vec::<String>::new();
-    tokenize_each(text, |term, _, _| terms.push(term));
-    terms
-}
-
-/// Converts a sparse record vector index into the compact posting-list type.
-fn as_record_idx(idx: usize) -> RecordIdx {
-    u32::try_from(idx).expect("full-text record count exceeded u32::MAX")
-}
-
-/// Converts a record token length into the compact per-record type.
-fn as_token_count(count: usize) -> u32 {
-    u32::try_from(count).expect("full-text record token count exceeded u32::MAX")
-}
-
-/// Converts a posting-list vector index into the compact term id type.
-fn as_term_id(idx: usize) -> TermId {
-    u32::try_from(idx).expect("full-text term count exceeded u32::MAX")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::FullTextDatastore;
+    use super::{model::ExpandedTerm, query::filter_fuzzy_expanded_terms, FullTextDatastore};
 
     #[test]
     fn updates_existing_record_and_removes_stale_postings() {
@@ -538,6 +388,94 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
         assert!(results[0].highlight_ranges.is_empty());
+        assert_eq!(results[0].matched_terms, vec!["apple", "pie"]);
+    }
+
+    #[test]
+    fn fuzzy_query_terms_expand_against_word_catalog() {
+        let mut store = FullTextDatastore::new();
+        store.upsert("a".to_string(), "Apple pie with apple slices".to_string());
+        store.upsert("b".to_string(), "Banana tart".to_string());
+
+        let results = store.search("apl sli", 10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "a");
+        assert!(results[0].highlight_ranges.is_empty());
+        assert_eq!(results[0].matched_terms, vec!["apple", "slices"]);
+    }
+
+    #[test]
+    fn fuzzy_query_expansion_caps_positive_terms() {
+        let mut store = FullTextDatastore::new();
+        for idx in 0..60 {
+            store.upsert(format!("id-{idx}"), format!("a{idx:02}"));
+        }
+
+        let (positive_groups, _) = store.resolve_query("a").expect("query should resolve");
+
+        assert_eq!(positive_groups.len(), 1);
+        assert_eq!(positive_groups[0].len(), 50);
+    }
+
+    #[test]
+    fn fuzzy_query_expansion_applies_relative_score_floor() {
+        let terms = filter_fuzzy_expanded_terms(
+            vec![
+                ExpandedTerm {
+                    term_id: 1,
+                    fuzzy_score: 100,
+                },
+                ExpandedTerm {
+                    term_id: 2,
+                    fuzzy_score: 70,
+                },
+                ExpandedTerm {
+                    term_id: 3,
+                    fuzzy_score: 69,
+                },
+            ],
+            false,
+        );
+
+        assert_eq!(
+            terms.iter().map(|term| term.term_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn parsed_atom_syntax_applies_to_full_text_term_expansion() {
+        let mut store = FullTextDatastore::new();
+        store.upsert("a".to_string(), "Apple pie".to_string());
+        store.upsert("b".to_string(), "Pineapple tart".to_string());
+        store.upsert("c".to_string(), "Crabapple crumble".to_string());
+
+        let prefix_results = store.search("^app", 10);
+        let substring_results = store.search("'apple", 10);
+
+        assert_eq!(
+            prefix_results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(prefix_results[0].matched_terms, vec!["apple"]);
+        assert_eq!(substring_results.len(), 3);
+    }
+
+    #[test]
+    fn negated_atoms_exclude_records_with_matching_catalog_terms() {
+        let mut store = FullTextDatastore::new();
+        store.upsert("a".to_string(), "Apple pie".to_string());
+        store.upsert("b".to_string(), "Apple tart".to_string());
+        store.upsert("c".to_string(), "Banana pie".to_string());
+
+        let results = store.search("apple !tart", 10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "a");
     }
 
     #[test]

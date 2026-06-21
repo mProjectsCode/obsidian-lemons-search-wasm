@@ -1,7 +1,10 @@
+pub(crate) mod full_text;
+pub(crate) mod fuzzy;
+
 use crate::{
-    full_text::FullTextDatastore,
-    fuzzy::{FuzzyDatastore, FuzzySessionState},
-    utils::{StoreHealth, StoreSearchResult},
+    core::{search_result::SearchResult, store_health::DatastoreHealth},
+    session::SearchSession,
+    stores::{full_text::FullTextDatastore, fuzzy::FuzzyDatastore},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +90,12 @@ impl Datastore {
         }
     }
 
+    pub(crate) fn set_full_text_fuzzy_search(&mut self, enabled: bool) {
+        if let Datastore::FullText(store) = self {
+            store.set_fuzzy_search(enabled);
+        }
+    }
+
     pub(crate) fn finish_bulk_load(&mut self) {
         match self {
             Datastore::Fuzzy(_) => {}
@@ -94,7 +103,7 @@ impl Datastore {
         }
     }
 
-    pub(crate) fn health(&self) -> StoreHealth {
+    pub(crate) fn health(&self) -> DatastoreHealth {
         match self {
             Datastore::Fuzzy(store) => store.health(),
             Datastore::FullText(store) => store.health(),
@@ -110,7 +119,7 @@ impl Datastore {
         session: &mut SearchSession,
         query: &str,
         max_results: usize,
-    ) -> Vec<StoreSearchResult> {
+    ) -> Vec<SearchResult> {
         match (self, session.kind) {
             (Datastore::Fuzzy(store), DatastoreKind::Fuzzy) => {
                 let Some(state) = session.fuzzy.as_mut() else {
@@ -122,38 +131,6 @@ impl Datastore {
                 store.search(query, max_results)
             }
             _ => Vec::new(),
-        }
-    }
-}
-
-/// Per-consumer search state tied to a single datastore.
-///
-/// Fuzzy search keeps incremental narrowing state here so separate UI clients
-/// can search the same store without sharing query history.
-pub(crate) struct SearchSession {
-    pub(crate) store_id: String,
-    kind: DatastoreKind,
-    fuzzy: Option<FuzzySessionState>,
-}
-
-impl SearchSession {
-    /// Creates a session with any implementation-specific state required by the
-    /// target datastore.
-    pub(crate) fn new(store_id: String, kind: DatastoreKind) -> Self {
-        SearchSession {
-            store_id,
-            kind,
-            fuzzy: match kind {
-                DatastoreKind::Fuzzy => Some(FuzzySessionState::default()),
-                DatastoreKind::FullText => None,
-            },
-        }
-    }
-
-    /// Clears cached query state after the underlying datastore changes.
-    pub(crate) fn reset(&mut self) {
-        if let Some(state) = self.fuzzy.as_mut() {
-            state.reset();
         }
     }
 }

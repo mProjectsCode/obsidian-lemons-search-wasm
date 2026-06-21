@@ -4,8 +4,9 @@ use wasm_bindgen::{prelude::*, JsValue};
 use web_sys::js_sys;
 
 use crate::{
-    datastore::{Datastore, DatastoreKind, SearchSession},
-    utils::StoreHealth,
+    core::store_health::DatastoreHealth,
+    session::SearchSession,
+    stores::{Datastore, DatastoreKind},
     DEFAULT_MAX_RESULTS,
 };
 
@@ -47,6 +48,13 @@ impl SearchEngine {
     /// Sets the maximum number of results returned by every search call.
     pub fn set_max_results(&mut self, max_results: usize) {
         self.max_results = max_results.max(1);
+    }
+
+    /// Enables or disables fuzzy term matching for all full-text datastores.
+    pub fn set_full_text_fuzzy_search(&mut self, enabled: bool) {
+        for store in self.stores.values_mut() {
+            store.set_full_text_fuzzy_search(enabled);
+        }
     }
 
     /// Creates a datastore and returns its opaque identifier.
@@ -175,7 +183,7 @@ impl SearchEngine {
     /// Returns diagnostic information for a datastore, or a missing marker.
     pub fn datastore_health(&self, store_id: &str) -> JsValue {
         let Some(store) = self.stores.get(store_id) else {
-            return StoreHealth::missing().into_js_object().into();
+            return DatastoreHealth::missing().into_js_object().into();
         };
         store.health().into_js_object().into()
     }

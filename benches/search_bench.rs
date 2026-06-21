@@ -186,7 +186,7 @@ fn build_incremental_typing_queries(dataset: &[String], config: BenchConfig) -> 
     let mut queries = Vec::with_capacity(config.queries.max(1));
     // Use a bounded number of seeds so the scenario emphasizes repeated prefix
     // narrowing instead of unrelated one-off queries.
-    let seed_count = (dataset.len() / 300).max(1).min(64);
+    let seed_count = (dataset.len() / 300).clamp(1, 64);
     let stride = (dataset.len() / seed_count).max(1);
 
     for i in 0..seed_count {

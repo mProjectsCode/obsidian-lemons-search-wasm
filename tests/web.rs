@@ -23,6 +23,20 @@ fn decode_store_result(entry: &JsValue) -> (String, u32, Vec<u32>) {
     (id, score, ranges)
 }
 
+fn decode_matched_terms(entry: &JsValue) -> Vec<String> {
+    let Ok(terms_value) = js_sys::Reflect::get(entry, &JsValue::from_str("m")) else {
+        return Vec::new();
+    };
+    if terms_value.is_undefined() {
+        return Vec::new();
+    }
+
+    js_sys::Array::from(&terms_value)
+        .iter()
+        .filter_map(|term| term.as_string())
+        .collect()
+}
+
 #[wasm_bindgen_test]
 fn search_respects_max_results_and_returns_expected_match_set() {
     let mut engine = SearchEngine::new();
@@ -154,4 +168,28 @@ fn full_text_datastore_matches_and_tokens_and_highlights_all_occurrences() {
     assert_eq!(id, "a");
     assert!(score > 0);
     assert!(ranges.is_empty());
+    assert_eq!(decode_matched_terms(&results.get(0)), vec!["apple", "pie"]);
+}
+
+#[wasm_bindgen_test]
+fn full_text_datastore_expands_fuzzy_query_terms_through_word_catalog() {
+    let mut engine = SearchEngine::new();
+    engine.set_max_results(10);
+    let store_id = engine.create_datastore("fullText");
+    let session_id = engine.create_session(&store_id);
+
+    engine.upsert_record(&store_id, "a", "Apple pie with apple slices");
+    engine.upsert_record(&store_id, "b", "Banana tart");
+
+    let results = engine.search_session(&session_id, "apl sli");
+
+    assert_eq!(results.length(), 1);
+    let (id, score, ranges) = decode_store_result(&results.get(0));
+    assert_eq!(id, "a");
+    assert!(score > 0);
+    assert!(ranges.is_empty());
+    assert_eq!(
+        decode_matched_terms(&results.get(0)),
+        vec!["apple", "slices"]
+    );
 }
